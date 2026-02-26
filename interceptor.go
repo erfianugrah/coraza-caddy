@@ -4,9 +4,11 @@
 package coraza
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -24,11 +26,36 @@ type rwInterceptor struct {
 	isWriteHeaderFlush            bool
 	wroteHeader                   bool
 	wroteBufferedBodyToDownstream bool
+	hijacked                      bool
+}
+
+// hijackTracker wraps an http.Hijacker and sets a flag on the interceptor
+// when Hijack() is called. This lets the response processor know the
+// connection has been taken over (e.g. for WebSocket) and must not attempt
+// further writes on the original ResponseWriter.
+type hijackTracker struct {
+	http.Hijacker
+	interceptor *rwInterceptor
+}
+
+func (h *hijackTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := h.Hijacker.Hijack()
+	if err == nil {
+		h.interceptor.hijacked = true
+	}
+	return conn, rw, err
 }
 
 // WriteHeader records the status code to be sent right before the moment
 // the body is being written.
 func (i *rwInterceptor) WriteHeader(statusCode int) {
+	if i.hijacked {
+		// Connection has been taken over (e.g. WebSocket upgrade).
+		// The 101 response was already sent on the hijacked connection;
+		// any further WriteHeader calls are invalid.
+		return
+	}
+
 	if i.wroteHeader {
 		log.Println("http: superfluous response.WriteHeader call")
 		return
@@ -59,6 +86,9 @@ func (i *rwInterceptor) overrideWriteHeader(statusCode int) {
 
 // flushWriteHeader sends the status code to the delegate writers
 func (i *rwInterceptor) flushWriteHeader() {
+	if i.hijacked {
+		return
+	}
 	if !i.isWriteHeaderFlush {
 		i.w.WriteHeader(i.statusCode)
 		i.isWriteHeaderFlush = true
@@ -78,6 +108,12 @@ func (i *rwInterceptor) cleanHeaders() {
 // If the body isn't accessible or the mime type isn't processable, the response
 // body is being writen to the delegate response writer directly.
 func (i *rwInterceptor) Write(b []byte) (int, error) {
+	if i.hijacked {
+		// Connection has been taken over; writes go through the hijacked
+		// net.Conn, not through the ResponseWriter. Silently discard.
+		return len(b), nil
+	}
+
 	if i.tx.IsInterrupted() {
 		// if there is an interruption it must be from at least phase 4 and hence
 		// WriteHeader or Write should have been called and hence the status code
@@ -197,6 +233,20 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 	i := &rwInterceptor{w: w, tx: tx, proto: r.Proto, statusCode: 200}
 
 	responseProcessor := func(tx types.Transaction, r *http.Request) error {
+		// If the connection was hijacked (e.g. WebSocket upgrade), the
+		// ResponseWriter is no longer usable. The initial HTTP request
+		// was already inspected (phases 1-2). We skip response processing
+		// because:
+		//  1. The 101 Switching Protocols response was sent directly on
+		//     the hijacked connection — we cannot intercept it.
+		//  2. Calling WriteHeader/Write on a hijacked ResponseWriter
+		//     panics or logs "WriteHeader on hijacked connection".
+		//  3. The WebSocket data stream is a binary framing protocol,
+		//     not HTTP — WAF response body rules don't apply.
+		if i.hijacked {
+			return nil
+		}
+
 		// We look for interruptions triggered at phase 3 (response headers)
 		// and during writing the response body. If so, response status code
 		// has been sent over the flush already.
@@ -237,9 +287,16 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 	}
 
 	var (
-		hijacker, isHijacker = i.w.(http.Hijacker)
-		pusher, isPusher     = i.w.(http.Pusher)
+		rawHijacker, isHijacker = i.w.(http.Hijacker)
+		pusher, isPusher        = i.w.(http.Pusher)
 	)
+
+	// Wrap the hijacker so we can detect when the connection is taken over
+	// (e.g. WebSocket upgrade) and skip response processing afterwards.
+	var tracker *hijackTracker
+	if isHijacker {
+		tracker = &hijackTracker{Hijacker: rawHijacker, interceptor: i}
+	}
 
 	switch {
 	case !isHijacker && isPusher:
@@ -251,13 +308,13 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 		return struct {
 			responseWriter
 			http.Hijacker
-		}{i, hijacker}, responseProcessor
+		}{i, tracker}, responseProcessor
 	case isHijacker && isPusher:
 		return struct {
 			responseWriter
 			http.Hijacker
 			http.Pusher
-		}{i, hijacker, pusher}, responseProcessor
+		}{i, tracker, pusher}, responseProcessor
 	default:
 		return struct {
 			responseWriter
